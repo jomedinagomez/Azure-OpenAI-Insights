@@ -1,0 +1,102 @@
+# Authenticate using Managed Identity
+Connect-AzAccount -Identity | Out-Null
+
+Write-Output "== Context =="
+$ctx = Get-AzContext
+Write-Output ("Environment: {0} | Tenant: {1}" -f $ctx.Environment.Name, $ctx.Tenant.Id)
+
+# 1) Can the Managed Identity see any subscriptions?
+$subs = Get-AzSubscription -WarningAction SilentlyContinue
+Write-Output ("Visible subscriptions: {0}" -f ($subs | Measure-Object).Count)
+
+if (-not $subs -or $subs.Count -eq 0) {
+    Write-Warning "Managed Identity sees 0 subscriptions. This is the #1 reason you get 0 deployments."
+    Write-Warning "Fix: assign the Automation Account's Managed Identity 'Reader' at the SUBSCRIPTION scope (or management group), then rerun."
+    return
+}
+
+# 2) Query Azure Resource Graph via REST (no Az.ResourceGraph module needed)
+# Official ARG REST endpoint
+# https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=...
+# (See Azure Resource Graph REST API docs)
+$rgUri = "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01"  # stable API version
+
+$kql = @"
+resources
+| where type =~ 'microsoft.cognitiveservices/accounts'
+| where kind =~ 'OpenAI'
+| project subscriptionId, resourceGroup, accountName=name, location
+"@
+
+$payload = @{
+    subscriptions = @($subs.Id)
+    query         = $kql
+} | ConvertTo-Json -Depth 5
+
+$rgResp = Invoke-AzRestMethod -Method POST -Uri $rgUri -Payload $payload
+$rgData = ($rgResp.Content | ConvertFrom-Json)
+
+$accounts = @($rgData.data)
+Write-Output ("OpenAI accounts found (ARG): {0}" -f $accounts.Count)
+
+if ($accounts.Count -eq 0) {
+    Write-Warning "No OpenAI accounts found via Resource Graph."
+    Write-Warning "If you are sure you have an Azure OpenAI resource, likely causes:"
+    Write-Warning " - The OpenAI resource is in a subscription not visible to this Managed Identity."
+    Write-Warning " - Wrong cloud/tenant context (AzureCloud vs AzureUSGovernment vs AzureChinaCloud)."
+    Write-Warning " - Resource Graph not enabled/available for that cloud/tenant scenario."
+    return
+}
+
+# 3) For each account, list deployments using ARM Deployments-List (authoritative)
+$results = New-Object System.Collections.Generic.List[object]
+
+foreach ($acct in $accounts) {
+    $subId = $acct.subscriptionId
+    $rg    = $acct.resourceGroup
+    $name  = $acct.accountName
+
+    $depUri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$rg/providers/Microsoft.CognitiveServices/accounts/$name/deployments?api-version=2024-10-01"
+    # Deployments-List returns properties.model.name/version/format etc. (see docs)
+    # [2](https://learn.microsoft.com/en-us/rest/api/aiservices/accountmanagement/deployments/list?view=rest-aiservices-accountmanagement-2024-10-01)
+
+    try {
+        $depResp = Invoke-AzRestMethod -Method GET -Uri $depUri
+        $depObj  = ($depResp.Content | ConvertFrom-Json)
+
+        foreach ($d in @($depObj.value)) {
+            $results.Add([pscustomobject]@{
+                SubscriptionId = $subId
+                ResourceGroup  = $rg
+                AccountName    = $name
+                Location       = $acct.location
+                DeploymentName = $d.name
+                ModelName      = $d.properties.model.name
+                ModelVersion   = $d.properties.model.version
+                ModelFormat    = $d.properties.model.format
+                SkuName        = $d.sku.name
+                SkuCapacity    = $d.sku.capacity
+                Provisioning   = $d.properties.provisioningState
+            })
+        }
+    }
+    catch {
+        Write-Warning ("Failed deployments list for account {0} in {1}/{2}: {3}" -f $name, $subId, $rg, $_.Exception.Message)
+    }
+}
+
+Write-Output ("Deployments found (ARM): {0}" -f $results.Count)
+
+# 4) Visualize (no saving): print a readable table to output
+if ($results.Count -gt 0) {
+    $results |
+      Sort-Object SubscriptionId, AccountName, DeploymentName |
+      Format-Table SubscriptionId, ResourceGroup, AccountName, Location, DeploymentName, ModelName, ModelVersion, SkuName, SkuCapacity, Provisioning -AutoSize |
+      Out-String -Width 400 |
+      Write-Output
+} else {
+    Write-Warning "0 deployments returned. If you have exactly 1 deployment, the most likely causes are:"
+    Write-Warning " - The OpenAI account is in a subscription the Managed Identity cannot see (missing Reader)."
+    Write-Warning " - You’re in the wrong cloud context (AzureCloud vs AzureUSGovernment vs AzureChinaCloud)."
+    Write-Warning " - You’re using a different tenant than where the OpenAI resource lives."
+}
